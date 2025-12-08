@@ -34,6 +34,7 @@ static void do_something(int connfd){
         msg("read() error");
         return;
     }
+    fprintf(stdout, "Received from client: %s\n", rbuf);
 
     // one write (no error handling for brevity)
     char wbuf[] = "Hello from server";
@@ -60,8 +61,10 @@ int main() {
 
     /* s4: listen for incoming connections
     socket is actually created here */
+    printf("Socket setup done ✅ \n");
     rv = listen(fd, SOMAXCONN);
     if (rv) { die("listen()"); }
+    printf("Started listening to client... \n");
 
     // s5: accept a connection & close it
     while(true){
@@ -71,6 +74,7 @@ int main() {
         if (connfd < 0) {
             continue; // ERROR
         }
+        printf("Accepted connection! \n");
 
         // s6: read/write data
         do_something(connfd);

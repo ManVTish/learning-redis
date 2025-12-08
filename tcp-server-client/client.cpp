@@ -24,7 +24,7 @@ static void die(const char *msg) {
 
 int main() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd) {
+    if (fd < 0) {
         die("socket()");
     }
 
@@ -37,9 +37,11 @@ int main() {
     if (rv) {
         die("connect");
     }
+    printf("Connected to server✌️ \n");
 
     char msg[] = "Hello from client";
     write(fd, msg, strlen(msg));
+    printf("Sent to server \n");
 
     char rbuf[64] = {};
     ssize_t n = read(fd, rbuf, sizeof(rbuf)-1);
