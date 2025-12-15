@@ -46,9 +46,11 @@ static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
     while(n>0) {
         ssize_t rv = write(fd, buf, n);
         if (rv <= 0) {
+            int e = errno;
+            fprintf(stderr, "write_all error rv=%zd errno=%d (%s)\n", rv, e, strerror(e));
             return -1;
         }
-        assert(sizeof(rv) <= n);
+        assert((size_t)rv <= n);
         n -= (size_t)rv;
         buf += rv;
     }
@@ -114,12 +116,13 @@ int main() {
 
     // multiple pipelined requests
     std::vector<std::string> query_list = {
-        "hello1", "hello2", "hello3", std::string(k_max_msg, 'z'), "hello5"
-        // large message needs multiple event loop iterations
+        "hello1", "hello2", "hello3",
+        std::string(k_max_msg, 'z'), // large message needs multiple event loop iterations
+        "hello5"
     };
 
     for(const std::string &q : query_list) {
-        int32_t err = send_req(fd, (uint8_t *)q.data(), (size_t)q.size());
+        int32_t err = send_req(fd, (uint8_t *)q.data(), q.size());
         if (err) {
             goto L_DONE;
         }
