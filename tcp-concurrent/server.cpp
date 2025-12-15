@@ -60,8 +60,9 @@ static void fd_set_nb(int fd) {
         return;
     }
 
-    errno = 0;
     flags |= O_NONBLOCK;
+
+    errno = 0;
     (void)fcntl(fd, F_SETFL, flags);
     if (errno) {
         die("fcntl error");
@@ -79,6 +80,13 @@ struct Conn * handle_accept(int fd) {
         msg_errno("accept() error");
         return NULL;
     }
+
+    uint32_t ip = client_addr.sin_addr.s_addr;
+    fprintf(stderr, "new client fd=%d from %u.%u.%u.%u:%u\n",
+        connfd,
+        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+        ntohs(client_addr.sin_port)
+    );
 
     fd_set_nb(connfd);
     Conn *conn = new Conn();
@@ -133,6 +141,8 @@ static void handle_write(Conn *conn) {
         return;
     }
 
+    fprintf(stderr, "fd=%d wrote %zd bytes, remaining=%zu\n", conn->fd, rv, conn->outgoing.size() - (size_t)rv);
+
     buf_consume(conn->outgoing, (size_t)rv);
 
     // update readiness intention
@@ -152,13 +162,14 @@ static void handle_read(Conn *conn) {
     // handle IO error
     if (rv < 0) {
         msg_errno("read() error");
+        fprintf(stderr, "fd=%d read error rv=%zd errno=%d (%s) incoming=%zu\n", conn->fd, rv, errno, strerror(errno), conn->incoming.size());
         conn->want_close = true;
         return;
     }
 
     // handle EOF
     if (rv == 0) {
-        if (conn->incoming.size() > 0) {
+        if (conn->incoming.size() == 0) {
             msg("client closed");
         } else {
             msg("unexpected EOF");
@@ -236,8 +247,8 @@ int main(){
 
         // wait for readiness
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
-        if (rv < 0 && errno != EINTR) {
-            continue;  // Not and ERROR
+        if (rv < 0 && errno == EINTR) {
+            continue;  // Not an ERROR
         }
         if (rv < 0) {
             die("poll()");
@@ -249,6 +260,7 @@ int main(){
                 if(fd2conn.size() <= (size_t)conn->fd) {
                     fd2conn.resize(conn->fd + 1);
                 }
+                assert(!fd2conn[conn->fd]);
                 fd2conn[conn->fd] = conn;
             }
         }
@@ -256,11 +268,17 @@ int main(){
         // if application code is ready for IO, handle socket connections
         for(size_t i=1; i < poll_args.size(); ++i) {
             uint32_t ready = poll_args[i].revents;
+            if (ready == 0) {
+                continue; // skip the 1st
+            }
+
             Conn *conn = fd2conn[poll_args[i].fd];
             if(ready & POLLIN) {
+                assert(conn->want_read);
                 handle_read(conn);
             }
             if(ready & POLLOUT) {
+                assert(conn->want_write);
                 handle_write(conn);
             }
 
