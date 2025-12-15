@@ -1,0 +1,278 @@
+// Std lib
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <assert.h>
+
+// System lib
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+// C++ lib
+#include <vector>
+
+const size_t k_max_msg = 32 << 20;
+
+static void msg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+}
+
+static void die(const char *msg) {
+    int err = errno;
+    fprintf(stderr, "[%d] %s\n", err, msg);
+    abort();
+}
+
+static void msg_errno(const char *msg) {
+    fprintf(stderr, "[errno:%d] %s\n", errno, msg);
+}
+
+struct Conn {
+    int fd = -1;
+    // apps intent for event loop
+    bool want_read = false;
+    bool want_write = false;
+    bool want_close = false;
+
+    // buffered i/o
+    std::vector<uint8_t> incoming;
+    std::vector<uint8_t> outgoing;
+};
+
+/* Provided by sys lib*/
+// struct pollfd {
+//     int fd;
+//     short events;
+//     short revents;
+// };
+
+static void fd_set_nb(int fd) {
+    errno = 0;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (errno) {
+        die("fcntl error");
+        return;
+    }
+
+    errno = 0;
+    flags |= O_NONBLOCK;
+    (void)fcntl(fd, F_SETFL, flags);
+    if (errno) {
+        die("fcntl error");
+    }
+
+    // above is equivalent to:
+    // fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+}
+
+struct Conn * handle_accept(int fd) {
+    struct sockaddr_in client_addr = {};
+    socklen_t addr_len = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addr_len);
+    if (connfd < 0) {
+        msg_errno("accept() error");
+        return NULL;
+    }
+
+    fd_set_nb(connfd);
+    Conn *conn = new Conn();
+    conn->fd = connfd;
+    conn->want_read = true; // read first request
+    return conn;
+}
+
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+    // append read data to conn->incoming buffer, append to back
+    buf.insert(buf.end(), data, data + len);
+}
+
+static void buf_consume(std::vector<uint8_t> &buf, size_t len) {
+    // remove from the front
+    buf.erase(buf.begin(), buf.begin() + len);
+}
+
+static bool try_one_request(Conn *conn) {
+    if(conn->incoming.size() < 4) {
+        return false; // not enough data for length prefix
+    }
+    uint32_t len = 0;
+    memcpy(&len, conn->incoming.data(), 4);
+    if (len > k_max_msg) {
+        conn->want_close = true;
+        return false;
+    }
+
+    if (4 + len > conn->incoming.size()) {
+        return false;
+    }
+
+    const uint8_t *request = &conn->incoming[4];
+
+    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
+    buf_append(conn->outgoing, request, len);
+
+    buf_consume(conn->incoming, 4 + len);
+    return true;
+}
+
+static void handle_write(Conn *conn) {
+    assert(conn->outgoing.size() > 0);
+    ssize_t rv = write(conn->fd, &conn->outgoing[0], conn->outgoing.size());
+    if (rv < 0 && errno == EAGAIN) {
+        return; // not ready, try again
+    }
+    if (rv < 0) {
+        msg_errno("write() error");
+        conn->want_close = true;
+        return;
+    }
+
+    buf_consume(conn->outgoing, (size_t)rv);
+
+    // update readiness intention
+    if (conn->outgoing.size() == 0) {
+        conn->want_write = false;
+        conn->want_read = true;
+    }
+}
+
+static void handle_read(Conn *conn) {
+    uint8_t buf[64*1024];
+    ssize_t rv = read(conn->fd, buf, sizeof(buf));
+    if (rv < 0 && errno == EAGAIN) {
+        return; // not ready, try again
+    }
+
+    // handle IO error
+    if (rv < 0) {
+        msg_errno("read() error");
+        conn->want_close = true;
+        return;
+    }
+
+    // handle EOF
+    if (rv == 0) {
+        if (conn->incoming.size() > 0) {
+            msg("client closed");
+        } else {
+            msg("unexpected EOF");
+        }
+        conn->want_close = true;
+        return;
+    }
+    buf_append(conn->incoming, buf, size_t(rv));
+
+    // parse request and generate response
+    // PIPELINING
+    while(try_one_request(conn)) {}
+
+    // update readiness intention
+    if (conn->outgoing.size() > 0) {  // has data to write
+        conn->want_write = true;
+        conn->want_read = false;
+
+        // socket is likely ready to write in request-response protocol,
+        // try to write without waiting for next iteration
+        return handle_write(conn);
+    }
+}
+
+int main(){
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket()");
+    }
+
+    int val = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+
+    struct sockaddr_in srv_addr = {};
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_port = ntohs(1234);
+    srv_addr.sin_addr.s_addr = ntohl(0); // wildcard 0.0.0.0
+    int rv = bind(fd, (const struct sockaddr *)&srv_addr, sizeof(srv_addr));
+    if (rv) {
+        die("bind()");
+    }
+
+    // set listen socket to non-blocking mode
+    fd_set_nb(fd);
+
+    rv = listen(fd, SOMAXCONN);
+    if (rv) {
+        die("listen()");
+    }
+
+    std::vector<Conn *> fd2conn;
+    // Event loop
+    std::vector<struct pollfd> poll_args;
+
+    while(true) {
+        poll_args.clear();
+        struct pollfd pfd = {fd, POLLIN, 0};
+
+        // socket for listening
+        poll_args.push_back(pfd);
+
+        // socket for all connections
+        for(Conn *conn : fd2conn) {
+            if (!conn) continue;
+
+            struct pollfd pfd = { conn->fd, POLLERR, 0 };
+            if (conn-> want_read) {
+                pfd.events |= POLLIN;
+            }
+            if (conn->want_write) {
+                pfd.events |= POLLOUT;
+            }
+            poll_args.push_back(pfd);
+        }
+
+        // wait for readiness
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        if (rv < 0 && errno != EINTR) {
+            continue;  // Not and ERROR
+        }
+        if (rv < 0) {
+            die("poll()");
+        }
+
+        // handle listening socket
+        if (poll_args[0].revents) {
+            if (Conn *conn = handle_accept(fd)) {
+                if(fd2conn.size() <= (size_t)conn->fd) {
+                    fd2conn.resize(conn->fd + 1);
+                }
+                fd2conn[conn->fd] = conn;
+            }
+        }
+
+        // if application code is ready for IO, handle socket connections
+        for(size_t i=1; i < poll_args.size(); ++i) {
+            uint32_t ready = poll_args[i].revents;
+            Conn *conn = fd2conn[poll_args[i].fd];
+            if(ready & POLLIN) {
+                handle_read(conn);
+            }
+            if(ready & POLLOUT) {
+                handle_write(conn);
+            }
+
+            if(ready & POLLERR || conn->want_close) {
+                (void)close(conn->fd);
+                fd2conn[conn->fd] = NULL;
+                delete conn;
+            }
+        }
+    }
+    // event loop end
+
+    return 0;
+}
+
